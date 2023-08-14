@@ -112,25 +112,26 @@ fn reduce_with_witness_inner<F: LurkField, C: Coprocessor<F>>(
                         metrics::counter!("evaluation", 1, "type" => "sym lookup step");
                         // Otherwise, look for a matching binding in env.
 
+                        let mut f = |expr: Ptr<F>, env: Ptr<F>, cont: ContPtr<F>|
                         // CIRCUIT: sym_otherwise
                         if env.is_nil() {
                             // CIRCUIT: needed_env_missing
-                            Control::Error(expr, env)
+                            Ok(Control::Error(expr, env))
                         } else {
                             // CIRCUIT: main
                             let (binding, smaller_env) =
-                                cons_witness.car_cdr_named(ConsName::Env, store, &env)?;
+                                store.car_cdr(&env)?;
+                            //cons_witness.car_cdr_named(ConsName::Env, store, &env)?;
                             if binding.is_nil() {
                                 // If binding is NIL, it's empty. There is no match. Return an error due to unbound variable.
 
                                 // CIRCUIT: needed_binding_missing
-                                Control::Error(expr, env)
+                                Ok(Control::Error(expr, env))
                             } else {
                                 // Binding is not NIL, so it is either a normal binding or a recursive environment.
 
                                 // CIRCUIT: with_binding
-                                let (var_or_rec_binding, val_or_more_rec_env) = cons_witness
-                                    .car_cdr_named(ConsName::EnvCar, store, &binding)?;
+                                let (var_or_rec_binding, val_or_more_rec_env) = store.car_cdr(&binding)?;
 
                                 match var_or_rec_binding.tag {
                                     ExprTag::Sym => {
@@ -148,7 +149,7 @@ fn reduce_with_witness_inner<F: LurkField, C: Coprocessor<F>>(
                                             // CIRCUIT: with_sym_binding_matched
 
                                             // Pass the binding's value to the continuation in a thunk.
-                                            Control::ApplyContinuation(val, env, cont)
+                                            Ok(Control::ApplyContinuation(val, env, cont))
                                         } else {
                                             // expr does not match the binding's var.
 
@@ -158,7 +159,7 @@ fn reduce_with_witness_inner<F: LurkField, C: Coprocessor<F>>(
                                                     // If performing a lookup, continue with remaining env.
 
                                                     // CIRCUIT: with_sym_binding_unmatched_old_lookup
-                                                    Control::Return(expr, smaller_env, cont)
+                                                    Ok(Control::Return(expr, smaller_env, cont))
                                                 }
                                                 _ =>
                                                 // Otherwise, create a lookup continuation, packaging current env
@@ -167,18 +168,14 @@ fn reduce_with_witness_inner<F: LurkField, C: Coprocessor<F>>(
                                                 // CIRCUIT: with_sym_binding_unmatched_new_lookup
                                                 {
                                                     metrics::counter!("evaluation", 1, "type" => "push lookup continuation");
-                                                    Control::Return(
+                                                    Ok(Control::Return(
                                                         expr,
                                                         smaller_env,
-                                                        cont_witness.intern_named_cont(
-                                                            ContName::Lookup,
-                                                            store,
                                                             Continuation::Lookup {
                                                                 saved_env: env,
                                                                 continuation: cont,
-                                                            },
-                                                        ),
-                                                    )
+                                                            }.intern_aux(store),
+                                                    ))
                                                 }
                                             }
                                         }
@@ -190,11 +187,7 @@ fn reduce_with_witness_inner<F: LurkField, C: Coprocessor<F>>(
                                         let rec_env = binding;
                                         let smaller_rec_env = val_or_more_rec_env;
 
-                                        let (v2, val2) = cons_witness.car_cdr_named(
-                                            ConsName::EnvCaar,
-                                            store,
-                                            &var_or_rec_binding,
-                                        )?;
+                                        let (v2, val2) = store.car_cdr(&var_or_rec_binding)?;
 
                                         if v2 == expr {
                                             // CIRCUIT: with_cons_binding_matched
@@ -223,7 +216,7 @@ fn reduce_with_witness_inner<F: LurkField, C: Coprocessor<F>>(
                                                     }
                                                 }
                                             };
-                                            Control::ApplyContinuation(val_to_use, env, cont)
+                                            Ok(Control::ApplyContinuation(val_to_use, env, cont))
                                         } else {
                                             // CIRCUIT: with_cons_binding_unmatched
                                             let env_to_use = if smaller_rec_env.is_nil() {
@@ -241,25 +234,48 @@ fn reduce_with_witness_inner<F: LurkField, C: Coprocessor<F>>(
                                             match cont.tag {
                                                 ContTag::Lookup => {
                                                     // CIRCUIT: with_cons_binding_unmatched_old_lookup
-                                                    Control::Return(expr, env_to_use, cont)
+                                                    Ok(Control::Return(expr, env_to_use, cont))
                                                 }
-                                                _ => Control::Return(
+                                                _ => Ok(Control::Return(
                                                     // CIRCUIT: with_cons_binding_unmatched_new_lookup
                                                     expr,
                                                     env_to_use,
-                                                    cont_witness.intern_named_cont(
-                                                        ContName::Lookup,
-                                                        store,
                                                         Continuation::Lookup {
                                                             saved_env: env,
                                                             continuation: cont,
-                                                        },
-                                                    ),
+                                                        }.intern_aux(store),
+                                                )
                                                 ),
                                             }
                                         }
                                     }
-                                    _ => Control::Error(expr, env), // CIRCUIT: with_other_binding
+                                    _ => Ok(Control::Error(expr, env)), // CIRCUIT: with_other_binding
+                                }
+                            }
+                        };
+
+                        {
+                            const MAX_FUSED_LOOKUP_STEPS: usize = 4;
+                            let mut i = 0;
+                            let mut expr = expr;
+                            let mut env = env;
+                            let mut cont = cont;
+                            loop {
+                                let x: Result<Control<F>, ReductionError> = f(expr, env, cont);
+                                let x = x?;
+
+                                match x {
+                                    Control::Return(new_expr, new_env, new_cont) => {
+                                        expr = new_expr;
+                                        env = new_env;
+                                        cont = new_cont;
+                                    }
+                                    _ => break x,
+                                }
+                                i += 1;
+
+                                if i >= MAX_FUSED_LOOKUP_STEPS {
+                                    break x;
                                 }
                             }
                         }
